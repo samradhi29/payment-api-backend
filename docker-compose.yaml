@@ -1,0 +1,269 @@
+﻿
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: ledgercore-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ledgercore
+      POSTGRES_USER: ledgercore
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ledgercore_dev_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ledgercore_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledgercore -d ledgercore"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  test-db:
+    image: postgres:17-alpine
+    container_name: ledgercore-test-db
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: ledgercore_test
+      POSTGRES_USER: ledgercore_test
+      POSTGRES_PASSWORD: ${TEST_POSTGRES_PASSWORD:-ledgercore_test_password}
+    volumes:
+      - ledgercore_test_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledgercore_test -d ledgercore_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: ledgercore-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ledgercore_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:3.9.1
+    container_name: ledgercore-kafka
+    hostname: kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  aggregator:
+    build:
+      context: ./aggregator
+      dockerfile: Dockerfile
+    container_name: ledgercore-aggregator-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      AGGREGATOR_REDIS_URL: redis://redis:6379/1
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      MAX_RETRIES: "2"
+      MERCHANT_LATENCY_BUDGET_MS: "10000"
+    ports:
+      - "8100:8100"
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8100/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  migrate:
+    build:
+      context: .
+      dockerfile: dockerfile
+    profiles: ["tools"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://ledgercore:${POSTGRES_PASSWORD:-ledgercore_dev_password}@db:5432/ledgercore
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  migrate-test:
+    build:
+      context: .
+      dockerfile: dockerfile
+    profiles: ["test"]
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://ledgercore_test:${TEST_POSTGRES_PASSWORD:-ledgercore_test_password}@test-db:5432/ledgercore_test
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      test-db:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: ledgercore-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://ledgercore:${POSTGRES_PASSWORD:-ledgercore_dev_password}@db:5432/ledgercore
+      AGGREGATOR_BASE_URL: http://ledgercore-aggregator-api:8100
+    volumes:
+      - ./app:/app/app
+    networks:
+      - default
+      - ledgercore-network
+    depends_on:
+      db:
+        condition: service_healthy
+      aggregator:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  worker:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: ledgercore-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.run_outbox_worker"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://ledgercore:${POSTGRES_PASSWORD:-ledgercore_dev_password}@db:5432/ledgercore
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: payment.attempt.events
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  metrics-service:
+    build:
+      context: ./metrics_service
+      dockerfile: Dockerfile
+    container_name: ledgercore-metrics-service
+    restart: unless-stopped
+    ports:
+      - "8200:8200"
+    environment:
+      METRICS_REDIS_URL: redis://redis:6379/1
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_METRICS_TOPIC: payment.attempt.events
+      KAFKA_METRICS_GROUP: payment-metrics-consumer
+      METRICS_DATABASE_URL: postgresql://ledgercore:${POSTGRES_PASSWORD:-ledgercore_dev_password}@db:5432/ledgercore
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8200/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ledgercore-frontend
+    restart: unless-stopped
+    env_file:
+      - ./frontend/.env.local
+    environment:
+      LEDGERCORE_API_URL: http://api:8000
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:3000').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  ledgercore_data:
+  ledgercore_test_data:
+  ledgercore_redis_data:
+  kafka_data:
+
+networks:
+  default: {}
+  ledgercore-network:
+    external: true
+    name: ledgercore-network

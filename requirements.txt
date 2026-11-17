@@ -1,0 +1,14 @@
+
+fastapi
+uvicorn[standard]
+sqlalchemy>=2.0
+psycopg[binary]
+alembic
+pydantic-settings
+redis
+celery
+httpx
+pytest
+pytest-asyncio
+cryptography
+aiokafka
