@@ -7,8 +7,6 @@ from uuid import uuid4
 from aiokafka import AIOKafkaProducer
 
 logger = logging.getLogger(__name__)
-
-
 class KafkaAttemptPublisher:
     def __init__(
         self,

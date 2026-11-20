@@ -13,7 +13,6 @@ class RedisCircuitBreaker:
         probe lock. Other requests are rejected until that probe succeeds,
         fails, or its short lease expires.
     """
-
     RECORD_FAILURE_SCRIPT = """
     local failures = redis.call("INCR", KEYS[1])
 
