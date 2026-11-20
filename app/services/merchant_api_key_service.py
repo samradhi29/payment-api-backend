@@ -21,7 +21,6 @@ def hash_api_key(api_key: str) -> str:
         api_key.encode("utf-8")
     ).hexdigest()
 
-
 def _normalize_datetime(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
