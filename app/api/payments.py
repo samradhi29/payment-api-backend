@@ -222,7 +222,6 @@ async def _handle_payu_callback(
             db=db,
             payment_id=payment.id,
         )
-
         logger.info(
             "PayU payment verified successfully: payment_id=%s",
             payment.id,
